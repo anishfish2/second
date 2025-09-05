@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import boto3
@@ -12,8 +12,12 @@ from contextlib import suppress
 from pydantic import BaseModel, Field
 from datetime import datetime
 import json
-
 from typing import Optional
+
+from database import get_db, create_tables, AsyncSessionLocal
+from models import VideoUpload
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +28,11 @@ print(os.getenv('AWS_ACCESS_KEY_ID'))
 print(os.getenv('AWS_SECRET_ACCESS_KEY'))
 print(os.getenv('AWS_REGION'))
 print(os.getenv('S3_BUCKET_NAME'))
+
+@app.on_event("startup")
+async def startup_event():
+    await create_tables()
+    print("Database tables created/verified")
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -38,9 +47,10 @@ S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 # Pydantic models
 class InitiateUploadRequest(BaseModel):
     filename: str
-    size: Optional[int] = Field(0, ge=0)
+    size: int 
     contentType: str
     desiredKey: str
+    userId: str
 
 class InitiateUploadResponse(BaseModel):
     uploadId: str
@@ -74,6 +84,20 @@ class SignPartReq(BaseModel):
     key: str
     uploadId: str
     partNumber: int
+
+class VideoMetadataResponse(BaseModel):
+    id: str
+    user_id: str
+    s3_key: str
+    filename: str
+    content_type: str
+    status: str
+    created_at: datetime
+    completed_at: Optional[datetime]
+    file_size: Optional[int]
+    title: Optional[str]
+    description: Optional[str]
+    is_public: bool
 
 
 # Configure CORS
@@ -117,11 +141,11 @@ async def health_check():
 
 
 @app.post("/api/upload/initiate", response_model=InitiateUploadResponse)
-async def initiate_multipart_upload(request: InitiateUploadRequest):
+async def initiate_multipart_upload(request: InitiateUploadRequest, db: AsyncSession = Depends(get_db)):
     """Initiate a multipart upload to S3"""
     file_extension = os.path.splitext(request.filename)[1] or ".webm"
     unique_key = request.desiredKey or f"videos/{uuid.uuid4()}{file_extension}"
-
+    
     part_size, _ = choose_part_size(request.size or 0)
 
     try:
@@ -132,7 +156,19 @@ async def initiate_multipart_upload(request: InitiateUploadRequest):
         )
         upload_id = resp["UploadId"]
 
-        print("After initialization, uplaod_id is", upload_id, "and unique_key is", unique_key)
+        video_record = VideoUpload(
+            user_id=request.userId,
+            s3_key=unique_key,
+            filename=request.filename,
+            content_type=request.contentType,
+            upload_id=upload_id,
+            status="uploading",
+            file_size=request.size if request.size > 0 else None
+        )
+        
+        db.add(video_record)
+        await db.commit()
+        await db.refresh(video_record)
 
         return InitiateUploadResponse(
             uploadId=upload_id,
@@ -141,10 +177,11 @@ async def initiate_multipart_upload(request: InitiateUploadRequest):
             partSize=part_size,
         )
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to initiate upload: {str(e)}")
 
 @app.post("/api/upload/complete")
-async def complete_multipart_upload(request: CompleteUploadRequest):
+async def complete_multipart_upload(request: CompleteUploadRequest, db: AsyncSession = Depends(get_db)):
     """Complete the multipart upload"""
     print("here", request.key, request.uploadId, request.parts)
     parts_sorted = sorted(request.parts, key=lambda p: p["PartNumber"])
@@ -164,6 +201,19 @@ async def complete_multipart_upload(request: CompleteUploadRequest):
             Body=json.dumps({"finishedAt": datetime.utcnow().isoformat() + "Z"}),
         )
 
+        # Update database record to completed
+        stmt = select(VideoUpload).where(VideoUpload.upload_id == request.uploadId)
+        result = await db.execute(stmt)
+        video_record = result.scalar_one_or_none()
+        
+        if video_record:
+            video_record.status = "completed"
+            video_record.completed_at = datetime.utcnow()
+            await db.commit()
+            print(f"Updated video record {video_record.id} to completed status")
+        else:
+            print(f"Warning: No video record found for upload_id {request.uploadId}")
+
         print(request.key.split("/")[-1] + "date.data")
         return {
             "success": True,
@@ -171,6 +221,7 @@ async def complete_multipart_upload(request: CompleteUploadRequest):
             "key": request.key
         }
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to complete upload: {str(e)}")
 
 
@@ -224,6 +275,140 @@ async def abort_multipart_upload(upload_id: str, key: str):
         return {"success": True, "message": "Upload aborted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to abort upload: {str(e)}")
+
+
+@app.get("/api/videos", response_model=List[VideoMetadataResponse])
+async def list_videos(user_id: Optional[str] = None, status: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    """List videos with optional filtering by user_id and status"""
+    try:
+        stmt = select(VideoUpload)
+        
+        if user_id:
+            stmt = stmt.where(VideoUpload.user_id == user_id)
+        if status:
+            stmt = stmt.where(VideoUpload.status == status)
+        
+        stmt = stmt.order_by(VideoUpload.created_at.desc())
+        
+        result = await db.execute(stmt)
+        videos = result.scalars().all()
+        
+        return [
+            VideoMetadataResponse(
+                id=video.id,
+                user_id=video.user_id,
+                s3_key=video.s3_key,
+                filename=video.filename,
+                content_type=video.content_type,
+                status=video.status,
+                created_at=video.created_at,
+                completed_at=video.completed_at,
+                file_size=video.file_size,
+                title=video.title,
+                description=video.description,
+                is_public=video.is_public
+            ) for video in videos
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list videos: {str(e)}")
+
+
+@app.get("/api/videos/{video_id}", response_model=VideoMetadataResponse)
+async def get_video(video_id: str, db: AsyncSession = Depends(get_db)):
+    """Get a specific video by ID"""
+    try:
+        stmt = select(VideoUpload).where(VideoUpload.id == video_id)
+        result = await db.execute(stmt)
+        video = result.scalar_one_or_none()
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        return VideoMetadataResponse(
+            id=video.id,
+            user_id=video.user_id,
+            s3_key=video.s3_key,
+            filename=video.filename,
+            content_type=video.content_type,
+            status=video.status,
+            created_at=video.created_at,
+            completed_at=video.completed_at,
+            file_size=video.file_size,
+            title=video.title,
+            description=video.description,
+            is_public=video.is_public
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get video: {str(e)}")
+
+
+class UpdateVideoRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    is_public: Optional[bool] = None
+
+
+@app.patch("/api/videos/{video_id}")
+async def update_video(video_id: str, request: UpdateVideoRequest, db: AsyncSession = Depends(get_db)):
+    """Update video metadata"""
+    try:
+        stmt = select(VideoUpload).where(VideoUpload.id == video_id)
+        result = await db.execute(stmt)
+        video = result.scalar_one_or_none()
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        if request.title is not None:
+            video.title = request.title
+        if request.description is not None:
+            video.description = request.description
+        if request.is_public is not None:
+            video.is_public = request.is_public
+        
+        await db.commit()
+        await db.refresh(video)
+        
+        return {"success": True, "message": "Video updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update video: {str(e)}")
+
+
+@app.delete("/api/videos/{video_id}")
+async def delete_video(video_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete a video and its S3 objects"""
+    try:
+        stmt = select(VideoUpload).where(VideoUpload.id == video_id)
+        result = await db.execute(stmt)
+        video = result.scalar_one_or_none()
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Delete from S3
+        try:
+            s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=video.s3_key)
+            # Also try to delete the date.data file
+            date_key = "/".join(video.s3_key.split("/")[:-1]) + "/date.data"
+            s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=date_key)
+        except Exception as s3_error:
+            print(f"Warning: Failed to delete S3 objects: {s3_error}")
+        
+        # Delete from database
+        await db.delete(video)
+        await db.commit()
+        
+        return {"success": True, "message": "Video deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete video: {str(e)}")
 
 
 if __name__ == "__main__":

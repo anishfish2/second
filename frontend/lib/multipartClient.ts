@@ -3,12 +3,12 @@ import { InitiateResponse, SignChunkResponse, ETagPart } from "./types";
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
-export async function initiateUpload(filename: string, size: number, contentType: string, desiredKey?: string) {
-  console.log("initiateUpload", filename, size, contentType);
+export async function initiateUpload(filename: string, size: number, contentType: string, desiredKey: string, userId: string) {
+  console.log("initiateUpload", filename, size, contentType, userId);
   const r = await fetch(`${API}/api/upload/initiate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename, size, contentType: contentType, desiredKey: desiredKey }),
+    body: JSON.stringify({ filename, size, contentType: contentType, desiredKey: desiredKey, userId: userId }),
   });
   if (!r.ok) throw new Error(await r.text());
   return (await r.json()) as InitiateResponse;

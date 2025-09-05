@@ -9,7 +9,7 @@ export type UploadController = {
 
 export async function createUploader(userId: string, finalKey: string, contentType = "video/webm") {
   // 1) Initiate (size unknown -> backend chooses default partSize)
-  const init: InitiateResponse = await initiateUpload("recording.webm", 0, contentType, finalKey);
+  const init: InitiateResponse = await initiateUpload("recording.webm", 0, contentType, finalKey, userId);
 
   // 2) Track multipart state
   let buffer: Blob[] = [];
